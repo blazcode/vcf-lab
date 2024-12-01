@@ -82,13 +82,15 @@ function Wait-ForVCSAReady {
     do {
         try {
             Connect-VIServer -Server $vCenter -User $Username -Password $Password -ErrorAction Stop -NotDefault | Out-Null
-            $VMs = Get-VM -Server $vCenter -ErrorAction Stop
-            if ($VMs) {
+            Send-Log -Message "Testing Get-TagAssignment to ensure services are fully operational" 
+            $Tags = Get-TagAssignment -Server $vCenter 
+            if ($Tags) {
                 $Ready = $true
             }
 
             Disconnect-VIServer -Server $vCenter -Confirm:$false
         } catch {
+            Disconnect-VIServer -Server $vCenter -Confirm:$false
             Send-Log -Message "Waiting for VCSA to become fully operational: $vCenter"
         }
 
@@ -168,15 +170,20 @@ foreach ($HostShortName in $MgmtHosts.Keys) {
 Send-Log -Message "Step 6: Searching for and powering on Management Domain VCSA"
 foreach ($FQDN in $MgmtHosts.Values) {
     try {
-        Connect-VIServer -Server $FQDN -User $HostUsername -Password $HostPassword -NotDefault
+        Send-Log -Message "Connecting to: $FQDN"
+        Connect-VIServer -Server $FQDN -User $HostUsername -Password $HostPassword -NotDefault | Out-Null
+
+        Send-Log -Message "...searching for vcf-mgmt1-vc1"
         $MgmtVCSA = Get-VM -Server $FQDN -Name "vcf-mgmt1-vc1" -ErrorAction SilentlyContinue
         if ($MgmtVCSA) {
+            Send-Log -Message "Found vcf-mgmt1-vc1 - powering on!"
             Start-VM -Server $FQDN -VM $MgmtVCSA -Confirm:$false
-            Send-Log -Message "Powered on Management Domain VCSA on host: $FQDN"
             Disconnect-VIServer -Server $FQDN -Confirm:$false
+            Send-Log -Message "Disconnected from $FQDN and stopping search"
             break
         }
         Disconnect-VIServer -Server $FQDN -Confirm:$false
+        Send-Log -Message "vcf-mgmt1-vc1 not found on $FQDN - disconnected and continuing search"
     } catch {
         Send-Log -Message "Error checking host $FQDN for Management Domain VCSA" -color "red"
     }
@@ -209,7 +216,7 @@ Disconnect-VIServer -Server $MgmtVC -Confirm:$false
 
 # Step 8: Power on Workload Domain Hosts
 Send-Log -Message "Step 8: Connecting to Root VCSA and powering on Workload Domain Hosts"
-Connect-VIServer -Server $RootVCSA -User $VCUsername -Password $VCPassword
+Connect-VIServer -Server $RootVCSA -User $VCUsername -Password $VCPassword | Out-Null
 foreach ($VMHost in $WLDHosts.Keys) {
     try {
         Start-VM -VM $VMHost -Confirm:$false | Out-Null
@@ -227,17 +234,19 @@ Send-Log -Message "Step 9: Exiting Maintenance Mode for Workload Domain Hosts"
 foreach ($HostShortName in $WLDHosts.Keys) {
     $HostFQDN = $WLDHosts[$HostShortName]
     try {
+        Send-Log -Message "Connecting to: $HostFQDN"
         $Server = Connect-VIServer -Server $HostFQDN -User $HostUsername -Password $HostPassword -NotDefault | Out-Null
         $HostObject = Get-VMHost -Server $HostFQDN | Where-Object { $_.Name -eq $HostFQDN }
 
         if ($HostObject) {
-            Set-VMHost -VMHost $HostObject -State Connected -Confirm:$false
+            Set-VMHost -VMHost $HostObject -State Connected -Confirm:$false | Out-Null
             Send-Log -Message "Exited Maintenance Mode: $HostFQDN"
         } else {
             Send-Log -Message "Could not find VMHost object for: $HostShortName" -color "red"
         }
 
-        Disconnect-VIServer -Server $Server -Confirm:$false
+        Disconnect-VIServer -Server $HostFQDN -Confirm:$false
+        Send-Log -Message "Disconnected from: $HostFQDN"
     } catch {
         Send-Log -Message "Failed to exit Maintenance Mode on host: $HostFQDN" -color "red"
     }
@@ -248,11 +257,14 @@ Send-Log -Message "Step 10: Waiting for Management Domain VCSA to be fully opera
 Wait-ForVCSAReady -vCenter $WLDVC -Username $VCUsername -Password $VCPassword
 
 Send-Log -Message "Step 10: Connecting to Workload Domain VCSA and powering on Edge Node by role tag"
-Connect-VIServer -Server $WLDVC -User $VCUsername -Password $VCPassword
+Connect-VIServer -Server $WLDVC -User $VCUsername -Password $VCPassword | Out-Null
+
+Send-Log -Message "Searching for Edge VMs"
 $EdgeVMs = Get-VM | Where-Object {
     $_.PowerState -eq "PoweredOff" -and
     (Get-TagAssignment -Entity $_ | Where-Object { $_.Tag.Name -eq "Edge" })
-}
+} 
+
 foreach ($VM in $EdgeVMs) {
     try {
         Start-VM -VM $VM -Confirm:$false | Out-Null
