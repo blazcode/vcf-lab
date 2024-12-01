@@ -115,8 +115,8 @@ Wait-ForHost -HostFQDN $RootESXi -Username $HostUsername -Password $HostPassword
 
 # Step 2: Power on root VCSA
 Send-Log -Message "Step 2: Powering on root VCSA"
-Connect-VIServer -Server $RootESXi -User $HostUsername -Password $HostPassword
-Start-VM -VM $RootVCSA -Confirm:$false
+Connect-VIServer -Server $RootESXi -User $HostUsername -Password $HostPassword | Out-Null
+Start-VM -VM $RootVCSA -Confirm:$false | Out-Null
 while ((Get-VM -Name $RootVCSA).PowerState -ne "PoweredOn") {
     Start-Sleep -Seconds 10
 }
@@ -128,10 +128,10 @@ Wait-ForHost -HostFQDN $RootVCSA -Username $VCUsername -Password $VCPassword
 
 # Step 4: Power on Management Domain Hosts
 Send-Log -Message "Step 4: Connecting to root VCSA and powering on Management Domain hosts"
-Connect-VIServer -Server $RootVCSA -User $VCUsername -Password $VCPassword
+Connect-VIServer -Server $RootVCSA -User $VCUsername -Password $VCPassword | Out-Null
 foreach ($VMHost in $MgmtHosts.Keys) {
     try {
-        Start-VM -VM $VMHost -Confirm:$false
+        Start-VM -VM $VMHost -Confirm:$false | Out-Null
         Send-Log -Message "Started Management Host: $VMHost"
         $FQDN = $MgmtHosts[$VMHost]
         Wait-ForHost -HostFQDN $FQDN -Username $HostUsername -Password $HostPassword
@@ -146,17 +146,19 @@ Send-Log -Message "Step 5: Exiting Maintenance Mode for Management Domain Hosts"
 foreach ($HostShortName in $MgmtHosts.Keys) {
     $HostFQDN = $MgmtHosts[$HostShortName]
     try {
+        Send-Log -Message "Connecting to: $HostFQDN"
         $Server = Connect-VIServer -Server $HostFQDN -User $HostUsername -Password $HostPassword -NotDefault
-        $HostObject = Get-VMHost | Where-Object { $_.Name -eq $HostShortName }
+        $HostObject = Get-VMHost -Server $Server | Where-Object { $_.Name -eq $HostFQDN }
 
         if ($HostObject) {
-            Set-VMHost -VMHost $HostObject -State Connected -Confirm:$false
+            Set-VMHost -VMHost $HostObject -State Connected -Confirm:$false | Out-Null
             Send-Log -Message "Exited Maintenance Mode: $HostFQDN"
         } else {
-            Send-Log -Message "Could not find VMHost object for: $HostShortName" -color "red"
+            Send-Log -Message "Could not find VMHost object for: $HostFQDN" -color "red"
         }
 
-        Disconnect-VIServer -Server $Server -Confirm:$false
+        Disconnect-VIServer -Server $HostFQDN -Confirm:$false | Out-Null
+        Send-Log -Message "Disconnected from: $HostFQDN"
     } catch {
         Send-Log -Message "Failed to exit Maintenance Mode on host: $HostFQDN" -color "red"
     }
