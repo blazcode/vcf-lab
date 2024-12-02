@@ -47,18 +47,22 @@ function Shutdown-VMs {
         [string[]]$TagPriority = @() # Ordered list of tags to process
     )
 
+    Send-Log -Message "...connecting to $vCenter"
     Connect-VIServer -Server $vCenter -User $VCUsername -Password $VCPassword | Out-Null
 
     # Process VMs by tag priority
     foreach ($Tag in $TagPriority) {
+        Send-Log -Message "...searching for powered on VMs tagged: $Tag"
         $TaggedVMs = Get-VM | Where-Object {
             $_.PowerState -eq "PoweredOn" -and 
             (Get-TagAssignment -Entity $_).Tag.Name -eq $Tag
         }
+        Send-Log -Message "...found: $TaggedVMs"
         foreach ($VM in $TaggedVMs) {
-            Send-Log -Message "Shutting down VM: $VM"
+            Send-Log -Message "...shutting down VM: $VM"
             Shutdown-VMGuest -VM $VM -Confirm:$false | Out-Null
             while ((Get-VM -Name $VM.Name).PowerState -ne "PoweredOff") {
+                Send-Log -Message "......waiting for power off"
                 Start-Sleep -Seconds 10
             }
         }
@@ -67,46 +71,66 @@ function Shutdown-VMs {
     Disconnect-VIServer -Server $vCenter -Confirm:$false
 }
 
-# Function to shut down ESXi hosts directly
-function Shutdown-NestedHosts {
+# Function to shut down vCenters on management hosts directly
+function Shutdown-VCSAs {
     param (
-        [string[]]$Hosts,
-        [string]$VCSAName
+        [string[]]$Hosts
     )
 
     foreach ($VMHost in $Hosts) {
         Connect-VIServer -Server $VMHost -User $HostUsername -Password $HostPassword | Out-Null
 
-        # Check if the VCSA is on this host
-        $VCSA = Get-VM -Name $VCSAName -ErrorAction SilentlyContinue
-        if ($VCSA -and $VCSA.PowerState -eq "PoweredOn") {
+        # Identify and power off all vCLS VMs
+        Send-Log -Message "...searching for VCSAs on: $VMHost"
+        $VCSAs = Get-VM | Where-Object { $_.Name -like "*-vc1" }
+        foreach ($VCSA in $VCSAs) {
+            Send-Log -Message "...shutting down: $VCSA"
             Shutdown-VMGuest -VM $VCSA -Confirm:$false | Out-Null
             while ((Get-VM -Name $VCSA.Name).PowerState -ne "PoweredOff") {
+                Send-Log "...waiting for $VCSA to be powered off"
                 Start-Sleep -Seconds 10
             }
         }
+    }
+}
 
+# Function to shut down ESXi hosts directly
+function Shutdown-NestedHosts {
+    param (
+        [string[]]$Hosts
+    )
+
+    foreach ($VMHost in $Hosts) {
+        Send-Log -Message "...connecting to $VMHost"
+        Connect-VIServer -Server $VMHost -User $HostUsername -Password $HostPassword | Out-Null
+        
         # Identify and power off all vCLS VMs
-        $vCLSVms = Get-VM | Where-Object { $_.Name -like "vCLS-*" }
+        Send-Log -Message "...searching for vCLS VMs to shutdown"
+        $vCLSVms = Get-VM -Server $VMHost | Where-Object { $_.Name -like "vCLS-*" }
         foreach ($vCLS in $vCLSVms) {
+            Send-Log -Message "...found: $vCLS"
+            $vCLS
             Stop-VM -VM $vCLS -Confirm:$false | Out-Null
             while ((Get-VM -Name $vCLS.Name).PowerState -ne "PoweredOff") {
+                Send-Log -Message "...waiting for $vCLS to be powered off"
                 Start-Sleep -Seconds 10
             }
         }
 
         # Place host in Maintenance Mode with NoDataMigration evacuation mode
+        Send-Log -Message "...putting $VMHost in maintenance mode"
         Set-VMHost -VMHost $VMHost -State "Maintenance" -VsanDataMigrationMode NoDataMigration -Confirm:$false | Out-Null
 
         # Verify the host is in Maintenance Mode
         $HostState = (Get-VMHost -Name $VMHost).State
         while ($HostState -ne "Maintenance") {
+            Send-Log -Message "...waiting for $VMHost to be in maintenance mode"
             Start-Sleep -Seconds 10
             $HostState = (Get-VMHost -Name $VMHost).State
         }
 
         # Power off the host
-        Send-Log -Message "Powering off host: $VMHost"
+        Send-Log -Message "...powering off host: $VMHost"
         Stop-VMHost -VMHost $VMHost -Force -Confirm:$false | Out-Null
         Disconnect-VIServer -Server $VMHost -Confirm:$false
     }
@@ -117,23 +141,25 @@ function Shutdown-NestedHosts {
 Send-Log -Message "Beginning lab shutdown!"
 
 # Step 1: Shutdown VMs in Workload Domain
-Send-Log -Message "Shutting down all VMs in Workload Domain"
+Send-Log -Message "Step1: Shutting down all VMs in Workload Domain"
 Shutdown-VMs -vCenter $WLDVC -TagPriority @("Edge", "NSX")
 
 # Step 2: Shutdown Workload Domain Hosts Directly
-Send-Log -Message "Shutting down nested ESXi hosts in Workload Domain"
-Shutdown-NestedHosts -Hosts $WLDHosts -VCSAName "vcf-wld1-vc1"
+Send-Log -Message "Step 2: Shutting down nested ESXi hosts in Workload Domain"
+Shutdown-NestedHosts -Hosts $WLDHosts
 
 # Step 3: Shutdown VMs in Management Domain
-Send-Log -Message "Shutting down all VMs in Management Domain"
-Shutdown-VMs -vCenter $MgmtVC -TagPriority @("Edge", "NSX", "SDDC", "VCSA")
+Send-Log -Message "Step 3: Shutting down all VMs in Management Domain"
+Shutdown-VMs -vCenter $MgmtVC -TagPriority @("Edge", "NSX", "SDDC")
+
+Shutdown-VCSAs -Hosts $MgmtHosts
 
 # Step 4: Shutdown Management Domain Hosts Directly
-Send-Log -Message "Shutting down nested ESXi hosts in Management Domain"
-Shutdown-NestedHosts -Hosts $MgmtHosts -VCSAName "vcf-mgmt1-vc1"
+Send-Log -Message "Step 4: Shutting down nested ESXi hosts in Management Domain"
+Shutdown-NestedHosts -Hosts $MgmtHosts
 
 # Step 5: Shutdown Root VCSA via ESXi Host
-Send-Log -Message "Connecting directly to ESXi host to shut down Root VCSA"
+Send-Log -Message "Step 5: Connecting directly to ESXi host to shut down Root VCSA"
 Connect-VIServer -Server $RootESXi -User $HostUsername -Password $HostPassword | Out-Null
 $RootVC = Get-VM -Name "vcsa"
 Send-Log -Message "Shutting down Root VCSA: $($RootVC.Name)"
