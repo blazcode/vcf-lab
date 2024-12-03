@@ -53,7 +53,7 @@ function Wait-ForHost {
     do {
         try {
             $Server = Connect-VIServer -Server $HostFQDN -User $Username -Password $Password -ErrorAction Stop -NotDefault
-            Send-Log -Message "...connected to $vCenter"
+            Send-Log -Message "...$HostFQDN is online"
             Disconnect-VIServer -Server $Server -Confirm:$false
             break
         } catch {
@@ -62,8 +62,8 @@ function Wait-ForHost {
                 throw "Host $HostFQDN did not become reachable within the timeout period."
             }
             Send-Log -Message "...waiting for $HostFQDN to be reachable"
-            Start-Sleep -Seconds 10
-            $ElapsedTime += 10
+            Start-Sleep -Seconds 15
+            $ElapsedTime += 15
         }
     } while ($true)
 }
@@ -77,14 +77,18 @@ function Wait-ForVCSAReady {
         [int]$TimeoutSeconds = 600 # Default timeout
     )
 
-    $ElapsedTime = 0
+    $ElapsedTime = 
     $Ready = $false
+
+    # Dislike sleeping... but addressing possible race condition between VCSA NTP service starting and login attempt; NTP must start and sync time first
+    Send-Log -Message "Waiting 5 minutes for VCSA to boot";
+    Start-Sleep -Seconds 300
 
     do {
         try {
-            #Send-Log -Message "...conneting to $vCenter"
+            Send-Log -Message "...conneting to $vCenter"
             Connect-VIServer -Server $vCenter -User $Username -Password $Password -ErrorAction Stop -NotDefault | Out-Null
-            #Send-Log -Message "...testing Get-TagAssignment on $vCenter to ensure services are fully operational" 
+            Send-Log -Message "...testing Get-TagAssignment on $vCenter to ensure services are fully operational" 
             $Tags = Get-TagAssignment -Server $vCenter -ErrorAction Stop
             if ($Tags) {
                 $Ready = $true
@@ -120,12 +124,20 @@ Wait-ForHost -HostFQDN $RootESXi -Username $HostUsername -Password $HostPassword
 
 # Step 2: Power on root VCSA
 Send-Log -Message "Step 2: Powering on root VCSA"
-Connect-VIServer -Server $RootESXi -User $HostUsername -Password $HostPassword | Out-Null
-Start-VM -VM $RootVCSA -Confirm:$false | Out-Null
-while ((Get-VM -Name $RootVCSA).PowerState -ne "PoweredOn") {
-    Start-Sleep -Seconds 10
+try {
+    Connect-VIServer -Server $RootESXi -User $HostUsername -Password $HostPassword | Out-Null
+    Start-VM -VM $RootVCSA -Confirm:$false -ErrorAction Stop | Out-Null
+    while ((Get-VM -Name $RootVCSA).PowerState -ne "PoweredOn") {
+        Start-Sleep -Seconds 10
+    }
+    Disconnect-VIServer -Server $RootESXi -Confirm:$false
+} catch {
+    if ($_.Exception.ExistingState -eq "PoweredOn") {
+        Send-Log -Message "...$RootVCSA already powered on" -Color Yellow
+    } else {
+        Send-Log -Message $_.Exception.InnerException -Color red
+    }
 }
-Disconnect-VIServer -Server $RootESXi -Confirm:$false
 
 # Step 3: Wait for root VCSA to be operational
 Send-Log -Message "Step 3: Waiting for root VCSA to be operational"
@@ -138,11 +150,15 @@ Connect-VIServer -Server $RootVCSA -User $VCUsername -Password $VCPassword | Out
 foreach ($VMHost in $MgmtHosts.Keys) {
     try {
         Start-VM -VM $VMHost -Confirm:$false | Out-Null
-        Send-Log -Message "Started Management Host: $VMHost"
+        Send-Log -Message "Started management host: $VMHost"
         $FQDN = $MgmtHosts[$VMHost]
         Wait-ForHost -HostFQDN $FQDN -Username $HostUsername -Password $HostPassword
     } catch {
-        Send-Log -Message "Failed to start Management Host: $VMHost" -color "red"
+        if ($_.Exception.ExistingState -eq "PoweredOn") {
+            Send-Log -Message "...$FQDN already powered on" -Color Yellow
+        } else {
+            Send-Log -Message $_.Exception.InnerException -Color red
+        }
     }
 }
 Disconnect-VIServer -Server $RootVCSA -Confirm:$false
@@ -152,20 +168,19 @@ Send-Log -Message "Step 5: Exiting Maintenance Mode for Management Domain Hosts"
 foreach ($HostShortName in $MgmtHosts.Keys) {
     $HostFQDN = $MgmtHosts[$HostShortName]
     try {
-        Send-Log -Message "Connecting to: $HostFQDN"
         $Server = Connect-VIServer -Server $HostFQDN -User $HostUsername -Password $HostPassword -NotDefault
         $HostObject = Get-VMHost -Server $Server | Where-Object { $_.Name -eq $HostFQDN }
 
         if ($HostObject) {
             Set-VMHost -VMHost $HostObject -State Connected -Confirm:$false | Out-Null
-            Send-Log -Message "Exited Maintenance Mode: $HostFQDN"
+            Send-Log -Message "Disabled Maintenance Mode on: $HostFQDN"
         } else {
             Send-Log -Message "Could not find VMHost object for: $HostFQDN" -color "red"
         }
 
         Disconnect-VIServer -Server $HostFQDN -Confirm:$false | Out-Null
     } catch {
-        Send-Log -Message "Failed to exit Maintenance Mode on host: $HostFQDN" -color "red"
+        Send-Log -Message $_.Exception.InnerException -Color red
     }
 }
 
@@ -181,7 +196,7 @@ foreach ($FQDN in $MgmtHosts.Values) {
         Send-Log -Message "...searching for vcf-mgmt1-vc1"
         $MgmtVCSA = Get-VM -Server $FQDN -Name "vcf-mgmt1-vc1" -ErrorAction SilentlyContinue
         if ($MgmtVCSA) {
-            Send-Log -Message "Found vcf-mgmt1-vc1 - powering on!"
+            Send-Log -Message "Found vcf-mgmt1-vc1; powering on!"
             Start-VM -Server $FQDN -VM $MgmtVCSA -Confirm:$false | Out-Null
             Disconnect-VIServer -Server $FQDN -Confirm:$false
             Send-Log -Message "Disconnected from $FQDN and stopping search"
@@ -190,7 +205,7 @@ foreach ($FQDN in $MgmtHosts.Values) {
         Disconnect-VIServer -Server $FQDN -Confirm:$false
         Send-Log -Message "...vcf-mgmt1-vc1 not found on $FQDN - disconnected and continuing search"
     } catch {
-        Send-Log -Message "Error checking host $FQDN for Management Domain VCSA" -color "red"
+        Send-Log -Message $_.Exception.InnerException -Color red
     }
 }
 #Wait-ForHost -HostFQDN $MgmtVC -Username $VCUsername -Password $VCPassword
@@ -211,9 +226,9 @@ foreach ($Tag in $Tags) {
     foreach ($VM in $VMsToStart) {
         try {
             Start-VM -Server $MgmtVC -VM $VM -Confirm:$false | Out-Null
-            Send-Log -Message "Started VM: $($VM.Name) with tag: $Tag"
+            Send-Log -Message "Started $Tag tagged VM: $($VM.Name)"
         } catch {
-            Send-Log -Message "Failed to start VM: $($VM.Name) with tag: $Tag" -color "red"
+            Send-Log -Message $_.Exception.InnerException -Color red
         }
     }
 }
@@ -229,7 +244,7 @@ foreach ($VMHost in $WLDHosts.Keys) {
         $FQDN = $WLDHosts[$VMHost]
         #Wait-ForHost -HostFQDN $FQDN -Username $HostUsername -Password $HostPassword
     } catch {
-        Send-Log -Message "Failed to start Workload Host: $VMHost" -color "red"
+        Send-Log -Message $_.Exception.InnerException -Color red
     }
 }
 Disconnect-VIServer -Server $RootVCSA -Confirm:$false
@@ -240,21 +255,19 @@ foreach ($HostShortName in $WLDHosts.Keys) {
     $HostFQDN = $WLDHosts[$HostShortName]
     Wait-ForHost -HostFQDN $HostFQDN -Username $HostUsername -Password $HostPassword
     try {
-        Send-Log -Message "Connecting to: $HostFQDN"
         $Server = Connect-VIServer -Server $HostFQDN -User $HostUsername -Password $HostPassword -NotDefault | Out-Null
         $HostObject = Get-VMHost -Server $HostFQDN | Where-Object { $_.Name -eq $HostFQDN }
 
         if ($HostObject) {
             Set-VMHost -VMHost $HostObject -State Connected -Confirm:$false | Out-Null
-            Send-Log -Message "Exited Maintenance Mode: $HostFQDN"
+            Send-Log -Message "Disabled Maintenance Mode on: $HostFQDN"
         } else {
             Send-Log -Message "Could not find VMHost object for: $HostShortName" -color "red"
         }
 
         Disconnect-VIServer -Server $HostFQDN -Confirm:$false
-        Send-Log -Message "Disconnected from: $HostFQDN"
     } catch {
-        Send-Log -Message "Failed to exit Maintenance Mode on host: $HostFQDN" -color "red"
+        Send-Log -Message $_.Exception.InnerException -Color red
     }
 }
 
