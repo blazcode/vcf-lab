@@ -295,3 +295,4 @@ foreach ($VM in $EdgeVMs) {
 Disconnect-VIServer -Server $WLDVC -Confirm:$false
 
 Send-Log -Message "Lab power-on process completed successfully!"
+Write-Output "Lab powered up!"
