@@ -170,3 +170,4 @@ while ((Get-VM -Name $RootVC.Name).PowerState -ne "PoweredOff") {
 
 Send-Log -Message "Root VCSA powered off"
 Send-Log -Message "All systems successfully powered off!"
+Write-Output "Lab powered down!"
